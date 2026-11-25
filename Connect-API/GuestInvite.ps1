@@ -1,16 +1,14 @@
 <#
-############################################################################# 
-
-Guest user invites and add to group
-
-############################################################################# 
-
+########################################################
+Bulk guest invite from CSV (set attributes, manager, group)
+########################################################
 #>
+
 Connect-MgGraph -Scopes "User.Invite.All","User.ReadWrite.All","GroupMember.ReadWrite.All"
 
-$csvPath = ''
-$groupId = ""
-$logPath = "$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+$csvPath = "$HOME/Documents/Guest Accounts/Guest_Account_List.csv"
+$groupId = "00000000-0000-0000-0000-000000000000"   # Replace with target group's ID
+$logPath = "$HOME/Documents/Guest Accounts/guest-invite-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 
 function Write-Log {
     param(
@@ -41,22 +39,20 @@ Import-Csv $csvPath | ForEach-Object {
     $fteManager  = Get-TrimmedValue $_.'FTE Manager'
     $companyName = Get-TrimmedValue $_.'Company name'
 
-    if ([string]::IsNullOrWhiteSpace($email)) {
+    if ([System.String]::IsNullOrWhiteSpace($email)) {
         Write-Log "Skipping empty email" "WARNING"
         return
     }
 
     $displayName = ("$firstName $lastName").Trim()
-    if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = $email }
+    if ([System.String]::IsNullOrWhiteSpace($displayName)) { $displayName = $email }
 
     Write-Log "Processing $displayName <$email>"
 
     try {
-        #Write-log "1"
         $guestUser = Get-MgUser -Filter "mail eq '$email'" -ConsistencyLevel eventual -ErrorAction SilentlyContinue
 
         if (-not $guestUser) {
-        #Write-log "2"
             $inv = New-MgInvitation `
                 -InvitedUserDisplayName $displayName `
                 -InvitedUserEmailAddress $email `
@@ -68,7 +64,6 @@ Import-Csv $csvPath | ForEach-Object {
 
             $guestUser = $null
             for ($i = 1; $i -le 12; $i++) {
-            #Write-log "3"
                 Start-Sleep 10
                 $guestUser = Get-MgUser -Filter "mail eq '$email'" -ConsistencyLevel eventual -ErrorAction SilentlyContinue
                 if ($guestUser) { break }
@@ -88,7 +83,7 @@ Import-Csv $csvPath | ForEach-Object {
             $updateParams.EmployeeId = $employeeId
         }
 
-        if ($state) { $updateParams.State = $state }
+        if ($state)   { $updateParams.State   = $state }
         if ($country) { $updateParams.Country = $country }
 
         if ($updateParams.Count -gt 0) {
@@ -97,7 +92,7 @@ Import-Csv $csvPath | ForEach-Object {
 
         if ($fteManager) {
             $managerUser = Get-MgUser -Filter "mail eq '$fteManager' or userPrincipalName eq '$fteManager'" -ConsistencyLevel eventual -ErrorAction SilentlyContinue
-            
+
             if ($managerUser) {
                 try {
                     Set-MgUserManagerByRef -UserId $guestUser.Id -BodyParameter @{
@@ -137,71 +132,113 @@ Import-Csv $csvPath | ForEach-Object {
 
 Write-Log "Complete. Log: $logPath"
 
-Disconnect-Graph
+Disconnect-MgGraph
 
 <#
-############################################################################# 
-
-Check Accounts if they're in the group
-
-############################################################################# 
-
+########################################################
+Re-invite user
+########################################################
 #>
 
-$targetEmails = @(
-"johndoe@company.com",
-"janedoe@company.com"
-)
+Connect-MgGraph -Scopes "User.Invite.All","User.ReadWrite.All"
 
-$groupId = ""
+$email = "guest@external.com"
+$safeEmail = $email.Replace("'","''")
+$user = @(Get-MgUser -Filter "mail eq '$safeEmail'" -Property Id,Mail,UserType)
 
-Connect-MgGraph -Scopes "User.Invite.All","User.ReadWrite.All","GroupMember.ReadWrite.All"
+if ($user.Count -ne 1) {
+    throw "Expected one user for $email; found $($user.Count)."
+}
 
-$selectProperties = @(
-    "Id", "GivenName", "Surname", "Mail", "UserPrincipalName", 
-    "EmployeeId", "JobTitle", "State", "Country", "CompanyName"
-)
+if ($user[0].UserType -ne "Guest") {
+    throw "$email is not a guest account."
+}
 
-$extractedData = foreach ($email in $targetEmails) {
-    $user = Get-MgUser -Filter "mail eq '$email' or userPrincipalName eq '$email'" `
-                     -Property $selectProperties `
-                     -ConsistencyLevel eventual `
-                     -ErrorAction SilentlyContinue
+New-MgInvitation `
+    -InvitedUserEmailAddress $email `
+    -InviteRedirectUrl "https://myapps.microsoft.com" `
+    -ResetRedemption `
+    -SendInvitationMessage `
+    -InvitedUser $user[0]
 
-    if ($user) {
-        $managerEmail = $null
-        $manager = Get-MgUserManager -UserId $user.Id -ErrorAction SilentlyContinue
-        
-        if ($manager) {
-            $managerEmail = if ($manager.Mail) { $manager.Mail } else { $manager.UserPrincipalName }
-            if (-not $managerEmail -and $manager.AdditionalProperties) {
-                $managerEmail = $manager.AdditionalProperties["mail"] ?? $manager.AdditionalProperties["userPrincipalName"]
-            }
-        }
+<#
+########################################################
+Invite guest
+########################################################
+#>
 
-        $isMember = $false
-        $userGroups = Get-MgUserMemberOf -UserId $user.Id -All -ErrorAction SilentlyContinue
-        if ($userGroups.Id -contains $groupId) {
-            $isMember = $true
-        }
+# Groups every new guest is added to
+$MfaGroupId             = "00000000-0000-0000-0000-000000000001"   # Replace with MFA enrollment group ID
+$SharePointGuestGroupId = "00000000-0000-0000-0000-000000000002"   # Replace with SharePoint guest group ID
 
-        [PSCustomObject]@{
-            'First Name'                    = $user.GivenName
-            'Last Name'                     = $user.Surname
-            'Email'                         = if ($user.Mail) { $user.Mail } else { $user.UserPrincipalName }
-            'Employee ID'                   = $user.EmployeeId
-            'Job Title'                     = $user.JobTitle
-            'State'                         = $user.State
-            'Country'                       = $user.Country
-            'FTE Manager'                   = $managerEmail
-            'Company name'                  = $user.CompanyName
-            'sso-sumtotal-externalad-users' = $isMember
-        }
+$email     = "guest@external.com"
+$firstName = "First"
+$lastName  = "Last"
+
+if ((Get-MgUser -Filter "usertype eq 'Guest' and mail eq '$email'" -All)) {
+    Write-Host "$email Guest user already exists" -BackgroundColor Blue
+} else {
+    New-MgInvitation -InvitedUserEmailAddress $email -InvitedUserDisplayName "$firstName $lastName" -InviteRedirectUrl 'https://myapplications.microsoft.com' -SendInvitationMessage:$false
+}
+
+Start-Sleep -Seconds 20
+
+$usr = Get-MgUser -Filter "usertype eq 'Guest' and mail eq '$email'" -All
+
+if ($usr) {
+    # Add user to the MFA enrollment group
+    Write-Host "Adding $firstName $lastName to the group"
+    New-MgGroupMember -GroupId $MfaGroupId -DirectoryObjectId $usr.Id
+
+    # Add user to the SharePoint guest group
+    New-MgGroupMember -GroupId $SharePointGuestGroupId -DirectoryObjectId $usr.Id
+
+    Write-Host "Setting Name: $firstName $lastName"
+    Update-MgUser -UserId $usr.Id -GivenName $firstName -Surname $lastName
+}
+
+Read-Host
+
+<#
+########################################################
+CSV guest invite
+########################################################
+#>
+
+Start-Transcript -Path .\logs\Log-GuestInvitation.log -Append
+
+Connect-MgGraph -Scopes "User.Invite.All","UserAuthenticationMethod.Read.All","User.Read.All"
+
+$template = Import-Csv .\GuestTemplate.txt
+
+foreach ($i in $template) {
+    if ((Get-MgUser -Filter "usertype eq 'Guest' and mail eq '$($i.email)'" -All)) {
+        Write-Host ($i.email.ToString() + ' Guest user already exists') -BackgroundColor Blue
     } else {
-        Write-Warning "User not found for email: $email"
+        New-MgInvitation -InvitedUserEmailAddress $i.email -InvitedUserDisplayName ($i.First.ToString() + ' ' + $i.Last.ToString()) -InviteRedirectUrl 'https://myapplications.microsoft.com' -SendInvitationMessage:$false
     }
 }
 
-$extractedData | Format-Table -AutoSize
+Start-Sleep -Seconds 20
 
-Disconnect-MgGraph
+# To figure out Strong Authentication Requirements
+foreach ($i in $template) {
+
+    $usr = Get-MgUser -Filter "usertype eq 'Guest' and mail eq '$($i.email)'" -All
+
+    # Add user to the MFA enrollment group
+    Write-Host 'Adding '$i.First' '$i.Last' to the group'
+    New-MgGroupMember -GroupId $MfaGroupId -DirectoryObjectId $usr.Id
+
+    # Add user to the SharePoint guest group
+    New-MgGroupMember -GroupId $SharePointGuestGroupId -DirectoryObjectId $usr.Id
+
+    Write-Host 'Setting Name: '$i.First' '$i.Last
+    Update-MgUser -UserId $usr.Id -GivenName $i.First -Surname $i.Last
+}
+
+Stop-Transcript
+
+Write-Host ''
+Write-Host 'EOF, Push Enter.' -BackgroundColor DarkGreen
+Read-Host
